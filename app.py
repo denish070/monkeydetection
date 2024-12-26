@@ -1,68 +1,71 @@
-# app.py
-import os
+from flask import Flask, request, Response
+import base64
 import time
 import threading
-from flask import Flask, request, Response, render_template_string
+import queue
 
 app = Flask(__name__)
 
-# A simple global to store the latest frame from local detection.
-# In production, a queue or more sophisticated data structure might be safer.
-latest_frame = None
-frame_lock = threading.Lock()
+# Store frames in a queue (or a ring buffer)
+FRAME_QUEUE = queue.Queue(maxsize=300)
 
-@app.route('/')
-def index():
-    """Serve a basic HTML page with an <img> that points to /video_feed."""
-    html = """
-    <html>
-      <head><title>Stream</title></head>
-      <body>
-        <h1>Live Bounding-Boxed Video</h1>
-        <img src="/video_feed" width="640" height="480" />
-      </body>
-    </html>
+@app.route('/upload_batch', methods=['POST'])
+def upload_batch():
     """
-    return render_template_string(html)
+    Receives JSON with an array of base64-encoded frames.
+    """
+    data = request.json
+    if not data or 'frames' not in data:
+        return "Invalid payload", 400
+    
+    for b64 in data['frames']:
+        frame_bytes = base64.b64decode(b64)
+        # Put them in the server's queue
+        try:
+            FRAME_QUEUE.put(frame_bytes, timeout=1)
+        except:
+            # If full, discard or handle differently
+            pass
 
-@app.route('/upload_frame', methods=['POST'])
-def upload_frame():
-    """
-    Receives a frame (JPEG bytes) from the local script (test.py) and stores it.
-    """
-    global latest_frame
-    file = request.files.get('frame')  # 'frame' is the key we use in test.py
-    if file:
-        img_bytes = file.read()
-        with frame_lock:
-            latest_frame = img_bytes
-        return "Frame received", 200
-    else:
-        return "No frame found", 400
+    return "Batch received", 200
 
-def gen_frames():
+def frame_generator():
     """
-    Generator function: yields the latest_frame as MJPEG data.
+    Yields frames from FRAME_QUEUE at a consistent FPS (say 10–15).
     """
     while True:
-        if latest_frame is not None:
-            with frame_lock:
-                frame = latest_frame
-            # Send the frame as a multipart message
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.03)  # ~30 FPS max, adjust as needed
+        try:
+            # get block or add a small timeout
+            frame = FRAME_QUEUE.get(timeout=5)
+        except:
+            # If no frames, just yield a blank or continue
+            time.sleep(0.1)
+            continue
+        
+        # yield as MJPEG
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        
+        # Control the playback rate
+        time.sleep(0.07)  # ~14 FPS
 
 @app.route('/video_feed')
 def video_feed():
-    """MJPEG stream of the bounding-boxed frames."""
-    return Response(gen_frames(),
+    """Serve a continuous MJPEG stream of frames from FRAME_QUEUE."""
+    return Response(frame_generator(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/')
+def index():
+    # Simple HTML to view the stream
+    return """
+    <html>
+      <body>
+        <h1>Buffered Video Stream</h1>
+        <img src="/video_feed" />
+      </body>
+    </html>
+    """
+
 if __name__ == '__main__':
-    # For local testing:
-    # app.run(host='0.0.0.0', port=5000, debug=True)
-    #
-    # On Render, you'd typically read the PORT from the environment:
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
